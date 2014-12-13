@@ -1,0 +1,876 @@
+From 9923b407eddc0af4200ff536974b82e230e0eac3 Mon Sep 17 00:00:00 2001
+From: Amaury de la Vieuville <amaury.dlv@gmail.com>
+Date: Thu, 27 Nov 2014 13:35:04 +0000
+Subject: [PATCH] x86-64: add ralloc/rfree syscalls
+
+---
+ arch/x86/syscalls/syscall_64.tbl  |   2 +
+ example.c                         |  65 ++++++
+ include/linux/syscalls.h          |   3 +
+ include/uapi/asm-generic/unistd.h |   8 +-
+ mm/Makefile                       |   2 +-
+ mm/ralloc.c                       | 439 ++++++++++++++++++++++++++++++++++++++
+ ralloc-server.c                   | 274 ++++++++++++++++++++++++
+ 7 files changed, 791 insertions(+), 2 deletions(-)
+ create mode 100644 example.c
+ create mode 100644 mm/ralloc.c
+ create mode 100644 ralloc-server.c
+
+diff --git a/arch/x86/syscalls/syscall_64.tbl b/arch/x86/syscalls/syscall_64.tbl
+index 35dd922..e151b0f 100644
+--- a/arch/x86/syscalls/syscall_64.tbl
++++ b/arch/x86/syscalls/syscall_64.tbl
+@@ -327,6 +327,8 @@
+ 318	common	getrandom		sys_getrandom
+ 319	common	memfd_create		sys_memfd_create
+ 320	common	kexec_file_load		sys_kexec_file_load
++321	64	ralloc			sys_ralloc
++322	64	rfree			sys_rfree
+ 
+ #
+ # x32-specific system call numbers start at 512 to avoid cache impact
+diff --git a/example.c b/example.c
+new file mode 100644
+index 0000000..101e7cf
+--- /dev/null
++++ b/example.c
+@@ -0,0 +1,65 @@
++/* vim: set noet ts=8 sw=8 : */
++
++/* cc -static -O0 ralloc-example.c -o ralloc-example */
++
++#define _GNU_SOURCE
++#include <unistd.h>
++#include <sys/syscall.h>
++#include <stdio.h>
++#include <string.h>
++#include <assert.h>
++
++#define __NR_ralloc  321
++#define __NR_rfree   322
++
++void *ralloc(unsigned long size)
++{
++	return (void *) syscall(__NR_ralloc, size, "10.0.2.2", 8700);
++}
++
++int rfree(void *addr)
++{
++	return syscall(__NR_rfree, (unsigned long) addr);
++}
++
++int main(int argc, char **argv)
++{
++	char *p, *addr;
++
++	addr = ralloc(0x10000);
++
++	if (!addr) {
++		printf("could not allocate memory\n");
++		return 1;
++	}
++
++	memset(addr, 1, 0x10000);
++	memset(addr+0x1000, 2, 0x1000);
++	memset(addr+0x2000, 3, 0x1000);
++	memset(addr+0x5000, 6, 0x1000);
++
++	addr[0] = 12;
++	addr[0x2fff] = 21;
++
++	for (p = addr+1; p < addr+0x1000; ++p)
++		assert(*p == 1);
++	for (p = addr+0x1000; p < addr+0x2000; ++p)
++		assert(*p == 2);
++
++	assert(addr[0x2fff] = 21);
++
++	addr[0x2fff] = 3;
++
++	for (p = addr+0x2000; p < addr+0x3000; ++p)
++		assert(*p == 3);
++	for (p = addr+0x8888; p < addr+0x8888+0x6666; ++p)
++		assert(*p == 1);
++	for (p = addr+0x5000; p < addr+0x6000; ++p)
++		assert(*p == 6);
++
++	assert(addr[0] == 12);
++
++	rfree(addr);
++	printf("OK\n");
++	return 0;
++}
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 0f86d85..74dd7b1 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -875,5 +875,8 @@ asmlinkage long sys_seccomp(unsigned int op, unsigned int flags,
+ 			    const char __user *uargs);
+ asmlinkage long sys_getrandom(char __user *buf, size_t count,
+ 			      unsigned int flags);
++asmlinkage long sys_ralloc(unsigned long size, const char __user *host,
++			   int port);
++asmlinkage long sys_rfree(unsigned long addr);
+ 
+ #endif
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 11d11bc..6688b61 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -867,8 +867,14 @@ __SYSCALL(__NR_fork, sys_fork)
+ __SYSCALL(__NR_fork, sys_ni_syscall)
+ #endif /* CONFIG_MMU */
+ 
++#define __NR_ralloc 1080
++__SYSCALL(__NR_ralloc, sys_ralloc)
++
++#define __NR_rfree 1081
++__SYSCALL(__NR_rfree, sys_rfree)
++
+ #undef __NR_syscalls
+-#define __NR_syscalls (__NR_fork+1)
++#define __NR_syscalls (__NR_netfree+1)
+ 
+ #endif /* __ARCH_WANT_SYSCALL_DEPRECATED */
+ 
+diff --git a/mm/Makefile b/mm/Makefile
+index 632ae77..12cc8f3 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -18,7 +18,7 @@ obj-y			:= filemap.o mempool.o oom_kill.o fadvise.o \
+ 			   mm_init.o mmu_context.o percpu.o slab_common.o \
+ 			   compaction.o balloon_compaction.o vmacache.o \
+ 			   interval_tree.o list_lru.o workingset.o \
+-			   iov_iter.o $(mmu-y)
++			   iov_iter.o ralloc.o $(mmu-y)
+ 
+ obj-y += init-mm.o
+ 
+diff --git a/mm/ralloc.c b/mm/ralloc.c
+new file mode 100644
+index 0000000..d189955
+--- /dev/null
++++ b/mm/ralloc.c
+@@ -0,0 +1,439 @@
++/* vim: set noet ts=8 sw=8 : */
++
++#include <linux/err.h>
++#include <linux/errno.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/linkage.h>
++#include <linux/module.h>
++#include <linux/printk.h>
++#include <linux/ctype.h>
++#include <linux/slab.h>
++#include <linux/syscalls.h>
++#include <linux/socket.h>
++#include <linux/highmem.h>
++#include <linux/in.h>
++#include <linux/inet.h>
++#include <net/sock.h>
++#include <net/tcp.h>
++#include <net/ip.h>
++
++#define RALLOC_BASE 0x1000
++
++#define RALLOC_CMD_ALLOC 0x1
++#define RALLOC_CMD_FREE  0x2
++#define RALLOC_CMD_GET   0x4
++#define RALLOC_CMD_PUT   0x5
++
++/*
++ * Ralloc configuration
++ */
++static unsigned long ralloc_base = RALLOC_BASE;
++
++/*
++ * Describes a remotely allocated memory area
++ */
++struct remote_vma_struct {
++	struct socket *sock;
++	struct vm_area_struct *vma;
++	unsigned long alloc_id;
++	unsigned long pfn;
++	pgoff_t pgoff;
++};
++
++struct ralloc_request {
++	unsigned cmd;
++	unsigned long alloc_id;
++	union {
++		unsigned long pgoff;
++		unsigned long size;
++	};
++};
++
++static ssize_t recv(struct socket *sock, void *dst, size_t len);
++static ssize_t send(struct socket *sock, void *src, size_t len);
++
++static void copy_to_page(struct page *dst, const void *src, int len)
++{
++	void *kaddr = kmap_atomic(dst);
++	memcpy(kaddr, src, len);
++	kunmap_atomic(kaddr);
++}
++
++static void copy_from_page(struct page *src, void *dst, int len)
++{
++	void *kaddr = kmap_atomic(src);
++	memcpy(dst, kaddr, len);
++	kunmap_atomic(kaddr);
++}
++
++static int __rvma_flush(struct remote_vma_struct *rvma, struct page *page)
++{
++	int err;
++	char *pagebuf;
++	struct ralloc_request req = {
++		.cmd = RALLOC_CMD_PUT,
++		.alloc_id = rvma->alloc_id,
++		.pgoff = rvma->pgoff,
++	};
++
++	err = send(rvma->sock, &req, sizeof(struct ralloc_request));
++	if (err)
++		return err;
++
++	pagebuf = kmalloc(PAGE_SIZE, GFP_KERNEL);
++	if (!pagebuf)
++		return -ENOMEM;
++
++	copy_from_page(page, pagebuf, PAGE_SIZE);
++	err = send(rvma->sock, pagebuf, PAGE_SIZE);
++	kfree(pagebuf);
++	return err;
++}
++
++static int rvma_flush(struct remote_vma_struct *rvma)
++{
++	int err = 0;
++	struct page *page;
++
++	if (rvma->pfn == ~0ul)
++		return 0;
++	get_user_pages(NULL, rvma->vma->vm_mm, rvma->pfn << PAGE_SHIFT,
++			1, 0, 1, &page, NULL);
++	zap_page_range(rvma->vma, rvma->pfn << PAGE_SHIFT, PAGE_SIZE, NULL);
++	err = __rvma_flush(rvma, page);
++	put_page(page);
++	return err;
++}
++
++static int __rvma_update(struct remote_vma_struct *rvma, struct page *page)
++{
++	int err;
++	char *pagebuf;
++	struct ralloc_request req = {
++		.cmd = RALLOC_CMD_GET,
++		.alloc_id = rvma->alloc_id,
++		.pgoff = rvma->pgoff,
++	};
++
++	err = send(rvma->sock, &req, sizeof(struct ralloc_request));
++	if (err)
++		return err;
++
++	pagebuf = kmalloc(PAGE_SIZE, GFP_KERNEL);
++	if (!pagebuf)
++		return -ENOMEM;
++
++	err = recv(rvma->sock, pagebuf, PAGE_SIZE);
++	copy_to_page(page, pagebuf, PAGE_SIZE);
++	kfree(pagebuf);
++	return err;
++}
++
++static int rvma_update(struct remote_vma_struct *rvma, struct vm_fault *vmf,
++		struct page **ret)
++{
++	int err;
++	struct page *page;
++
++	*ret = NULL;
++	page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, rvma->vma,
++			(unsigned long) vmf->virtual_address);
++	if (!page)
++		return -ENOMEM;
++	rvma->pfn = (unsigned long) vmf->virtual_address >> PAGE_SHIFT;
++	rvma->pgoff = vmf->pgoff;
++	err = __rvma_update(rvma, page);
++	if (err) {
++		put_page(page);
++		return err;
++	}
++	*ret = page;
++	return 0;
++}
++
++int rvma_connect(struct remote_vma_struct *rvma, const char *host, int port)
++{
++	int err;
++	struct socket *sock;
++	struct sockaddr_in *addr;
++	struct sockaddr_storage addr_storage;
++
++	sock = kmalloc(sizeof(struct socket), GFP_KERNEL);
++	if (!sock) {
++		err = -ENOMEM;
++		goto error;
++	}
++
++	err = sock_create(PF_INET, SOCK_STREAM, 0, &sock);
++	if (err)
++		goto free;
++
++	addr = (struct sockaddr_in *) &addr_storage;
++	addr->sin_family = AF_INET;
++	addr->sin_port = htons(port);
++	addr->sin_addr.s_addr = in_aton(host);
++	if (err) {
++		pr_warn("ralloc: invalid server address\n");
++		goto release;
++	}
++	err = sock->ops->connect(sock, (struct sockaddr *) &addr_storage,
++			sizeof(struct sockaddr_in), 0);
++	if (err) {
++		pr_warn("ralloc: could not connect to server\n");
++		goto release;
++	}
++	rvma->sock = sock;
++	return 0;
++
++release:
++	sock_release(sock);
++free:
++	kfree(sock);
++error:
++	return err;
++}
++
++int rvma_init(struct remote_vma_struct *rvma, struct vm_area_struct *vma)
++{
++	memset(rvma, 0, sizeof(struct remote_vma_struct));
++	rvma->vma = vma;
++	rvma->pfn = ~0ul;
++	rvma->alloc_id = rvma->vma->vm_start >> PAGE_SHIFT;
++	return 0;
++}
++
++int rvma_alloc(struct remote_vma_struct *rvma, unsigned long size)
++{
++	struct ralloc_request req = {
++		.cmd = RALLOC_CMD_ALLOC,
++		.alloc_id = rvma->alloc_id,
++		.size = size,
++	};
++
++	return send(rvma->sock, &req, sizeof(struct ralloc_request));
++}
++
++void rvma_release(struct remote_vma_struct *rvma)
++{
++	if (rvma->sock) {
++		struct ralloc_request req = {
++			.cmd = RALLOC_CMD_FREE,
++			.alloc_id = rvma->alloc_id,
++
++		};
++
++		send(rvma->sock, &req, sizeof(struct ralloc_request));
++		sock_release(rvma->sock);
++		kfree(rvma->sock);
++		rvma->sock = NULL;
++	}
++}
++
++static void ralloc_vm_close(struct vm_area_struct *vma)
++{
++	struct remote_vma_struct *rvma;
++
++	rvma = vma->vm_private_data;
++	if (rvma) {
++		rvma_release(rvma);
++		kzfree(rvma);
++	}
++}
++
++
++static int ralloc_vm_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++{
++	int err;
++	struct remote_vma_struct *rvma = vma->vm_private_data;
++	struct page *page;
++
++#if 0
++	pr_warn("ralloc: fault (vma=%p,pgoff=%ld,flags=%x,page=%p)\n",
++			vmf->virtual_address, vmf->pgoff, vmf->flags,
++			vmf->page);
++#endif
++
++	if (rvma->pfn != ~0ul) {
++		err = rvma_flush(rvma);
++		if (err)
++			goto error;
++	}
++
++	rvma_update(rvma, vmf, &page);
++	if (err)
++		goto error;
++
++	vmf->page = page;
++	return 0;
++error:
++	if (err == -ENOMEM)
++		return VM_FAULT_OOM;
++	return VM_FAULT_SIGBUS;
++}
++
++static struct vm_operations_struct ralloc_vm_ops = {
++	.close = ralloc_vm_close,
++	.fault = ralloc_vm_fault,
++};
++
++SYSCALL_DEFINE3(ralloc, unsigned long, size, const char __user *, host,
++		int, port)
++{
++	char khost[256];
++	unsigned long addr;
++	struct vm_unmapped_area_info info;
++	struct mm_struct *mm = current->mm;
++	struct vm_area_struct *vma;
++	struct remote_vma_struct *rvma;
++	int err;
++
++	if (!size || !host)
++		return 0;
++
++	memset(khost, 0, sizeof(khost));
++	if (strncpy_from_user(khost, host, sizeof(khost)-1) < 0)
++		return 0;
++	khost[sizeof(khost)-1] = '\0';
++
++	size = PAGE_ALIGN(size);
++
++	info.flags = 0;
++	info.length = size;
++	info.low_limit = ralloc_base;
++	info.high_limit = ~0;
++	info.align_mask = 0;
++
++	down_write(&mm->mmap_sem);
++
++	addr = unmapped_area(&info);
++
++	if (addr & ~PAGE_MASK) {
++		pr_warn("ralloc: could not find unmapped area\n");
++		goto error;
++	}
++
++	vma = kmem_cache_zalloc(vm_area_cachep, GFP_KERNEL);
++	if (!vma)
++		goto error;
++
++	INIT_LIST_HEAD(&vma->anon_vma_chain);
++	vma->vm_mm = mm;
++	vma->vm_start = addr;
++	vma->vm_end = addr + size;
++	vma->vm_ops = &ralloc_vm_ops;
++	vma->vm_flags = VM_READ | VM_WRITE | VM_EXEC;
++	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
++	vma->vm_pgoff = 0;
++
++	err = insert_vm_struct(mm, vma);
++	if (err) {
++		kfree(vma);
++		goto error;
++	}
++
++	rvma = kzalloc(sizeof(struct remote_vma_struct), GFP_KERNEL);
++	if (!rvma)
++		goto error;
++
++	err = rvma_init(rvma, vma);
++	if (err)
++		goto free_rvma;
++	err = rvma_connect(rvma, khost, port);
++	if (err)
++		goto free_rvma;
++
++	vma->vm_private_data = rvma;
++
++	err = rvma_alloc(rvma, size);
++	if (err)
++		goto release_rvma;
++
++	up_write(&mm->mmap_sem);
++	return addr;
++
++release_rvma:
++	rvma_release(rvma);
++free_rvma:
++	kfree(rvma);
++error:
++	up_write(&mm->mmap_sem);
++	return 0;
++}
++
++SYSCALL_DEFINE1(rfree, unsigned long, addr)
++{
++	struct mm_struct *mm = current->mm;
++	struct vm_area_struct *vma;
++	int err = 0;
++
++	down_write(&mm->mmap_sem);
++	vma = find_vma(current->mm, addr);
++	if (!vma)
++		return -EINVAL;
++	err = do_munmap(mm, vma->vm_start, vma->vm_end - vma->vm_start);
++	up_write(&mm->mmap_sem);
++	return err;
++}
++
++static ssize_t send(struct socket *sock, void *src, size_t len)
++{
++	struct msghdr msg;
++	struct iovec iov;
++	ssize_t size, n = 0;
++	mm_segment_t mmseg;
++
++	msg.msg_control = NULL;
++	msg.msg_controllen = 0;
++	msg.msg_flags = 0;
++	msg.msg_iov = &iov;
++	msg.msg_iovlen = 1;
++	msg.msg_name = 0;
++	msg.msg_namelen = 0;
++	while (n < len) {
++		iov.iov_base = src + n;
++		iov.iov_len = len - n;
++
++		mmseg = get_fs();
++		set_fs(KERNEL_DS);
++		size = sock_sendmsg(sock, &msg, len - n);
++		set_fs(mmseg);
++		if (size < 0)
++			return size;
++		else
++			n += size;
++	}
++	return 0;
++}
++
++static ssize_t recv(struct socket *sock, void *dst, size_t len)
++{
++	struct msghdr msg;
++	struct iovec iov;
++	ssize_t size, n = 0;
++	mm_segment_t mmseg;
++
++	msg.msg_control = NULL;
++	msg.msg_controllen = 0;
++	msg.msg_flags = 0;
++	msg.msg_name = 0;
++	msg.msg_namelen = 0;
++	msg.msg_iov = &iov;
++	msg.msg_iovlen = 1;
++	while (n < len) {
++		iov.iov_base = dst;
++		iov.iov_len = len;
++
++		mmseg = get_fs();
++		set_fs(KERNEL_DS);
++		size = sock_recvmsg(sock, &msg, len - n, msg.msg_flags);
++		set_fs(mmseg);
++		if (size < 0)
++			return size;
++		else if (size == 0)
++			return -EIO;
++		else
++			n += size;
++	}
++	return 0;
++}
+diff --git a/ralloc-server.c b/ralloc-server.c
+new file mode 100644
+index 0000000..6b0af36
+--- /dev/null
++++ b/ralloc-server.c
+@@ -0,0 +1,274 @@
++/* vim: set noet ts=8 sw=8 : */
++
++/* cc ralloc-server.c -o ralloc-server */
++
++#include <stdio.h>
++#include <errno.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <sys/queue.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <netdb.h>
++
++#define PORT            8700
++
++#define PAGE_SIZE       0x1000
++
++#define CMD_ALLOC	0x1
++#define CMD_FREE	0x2
++#define CMD_GET		0x4
++#define CMD_PUT		0x5
++
++struct request {
++	unsigned cmd;
++	unsigned long allocid;
++	union {
++		unsigned long pgoff;
++		unsigned long size;
++	};
++};
++
++int create_socket(uint16_t port);
++int accept_client(int sock, fd_set *set);
++int sock_send(int sock, char *buf, size_t len);
++int sock_recv(int sock, char *buf, size_t len);
++
++struct alloc {
++	LIST_ENTRY(alloc) list;
++	unsigned long id;
++	void *ptr;
++};
++
++struct client {
++	LIST_ENTRY(client) list;
++	LIST_HEAD(alloc_list, alloc) allocs;
++	int sock;
++};
++
++LIST_HEAD(client_list, client) clients;
++
++struct alloc *find_alloc(struct client *client, unsigned long id)
++{
++	struct alloc *alloc;
++
++	for (alloc = client->allocs.lh_first; alloc;
++			alloc = alloc->list.le_next)
++		if (alloc->id == id)
++			break;
++	return alloc;
++}
++
++struct client *find_client(int sock)
++{
++	struct client *client;
++
++	for (client = clients.lh_first; client;
++			client = client->list.le_next)
++		if (client->sock == sock)
++			break;
++	return client;
++}
++
++void alloc_remove(struct alloc *alloc)
++{
++	free(alloc->ptr);
++	LIST_REMOVE(alloc, list);
++	free(alloc);
++}
++
++int handle_client_command(struct client *client)
++{
++	int err, sock = client->sock;
++	struct request r;
++	struct alloc *alloc;
++
++	sock_recv(sock, (char *) &r, sizeof(r));
++
++	switch (r.cmd) {
++	case CMD_FREE:
++		alloc = find_alloc(client, r.allocid);
++		if (!alloc) return -1;
++		printf("freeing alloc for client %d (id=%lx)\n",
++				client->sock, alloc->id);
++		alloc_remove(alloc);
++		break;
++
++	case CMD_ALLOC:
++		alloc = malloc(sizeof(struct alloc));
++		if (!alloc) goto allocfail;
++		alloc->ptr = malloc(r.size);
++		if (!alloc->ptr) goto allocfail;
++		alloc->id = r.allocid;
++		LIST_INSERT_HEAD(&client->allocs, alloc, list);
++		printf("alloc'ed %zu bytes at %p for client %d (id=%lx)\n",
++				r.size, alloc->ptr, client->sock, alloc->id);
++		break;
++
++	case CMD_GET:
++		alloc = find_alloc(client, r.allocid);
++		if (!alloc) return -1;
++		err = sock_send(sock, alloc->ptr + (PAGE_SIZE * (r.pgoff - 1)),
++				PAGE_SIZE);
++		if (err) return -1;
++		break;
++
++	case CMD_PUT:
++		alloc = find_alloc(client, r.allocid);
++		if (!alloc) return -1;
++		err = sock_recv(sock, alloc->ptr + (PAGE_SIZE * (r.pgoff - 1)),
++				PAGE_SIZE);
++		if (err) return -1;
++		break;
++
++	default:
++		return -1;
++	}
++
++	return 0;
++
++allocfail:
++	perror("malloc");
++	exit(1);
++}
++
++void client_remove(struct client *client)
++{
++	int sock = client->sock;
++
++	close(sock);
++	LIST_REMOVE(client, list);
++	free(client);
++}
++
++int main(int argc, char **argv)
++{
++	int sock, i;
++	fd_set active_set, read_set;
++	struct client *client;
++
++	LIST_INIT(&clients);
++
++	sock = create_socket(PORT);
++	if (listen(sock, 1) < 0) {
++		perror("listen");
++		exit(1);
++	}
++
++	FD_ZERO(&active_set);
++	FD_SET(sock, &active_set);
++	for (;;) {
++		read_set = active_set;
++		if (select(FD_SETSIZE, &read_set, NULL, NULL, NULL) < 0) {
++			perror("select");
++			exit(1);
++		}
++		for (i = 0; i < FD_SETSIZE; ++i) {
++			if (!FD_ISSET(i, &read_set))
++				continue;
++			if (i == sock) {
++				if (accept_client(sock, &active_set))
++					printf("error on connect\n");
++			} else {
++				client = find_client(i);
++				if (handle_client_command(client)) {
++					printf("client %d disconnected\n",
++							client->sock);
++					client_remove(client);
++					FD_CLR(i, &active_set);
++				}
++			}
++		}
++	}
++	return 0;
++}
++
++int sock_send(int sock, char *buf, size_t len)
++{
++	ssize_t err;
++	size_t n = 0;
++
++	while (n < len) {
++		err = send(sock, buf + n, len - n, 0);
++		if (err < 0) {
++			perror("recv");
++			return err;
++		} else
++			n += err;
++	}
++	return 0;
++}
++
++int sock_recv(int sock, char *buf, size_t len)
++{
++	ssize_t err;
++	size_t n = 0;
++
++	while (n < len) {
++		err = recv(sock, buf + n, len - n, 0);
++		if (err < 0) {
++			perror("recv");
++			return err;
++		} else if (err == 0) {
++			return -1;
++		} else
++			n += err;
++	}
++	return 0;
++}
++
++int accept_client(int sock, fd_set *set)
++{
++	int new;
++	socklen_t size;
++	struct sockaddr_in clientname;
++	struct client *client;
++
++	size = sizeof(clientname);
++	new = accept(sock, (struct sockaddr *) &clientname,
++			&size);
++	if (new < 0) {
++		perror("accept");
++		exit(1);
++	}
++	printf("client %d connected from host %s\n",
++			new, inet_ntoa(clientname.sin_addr));
++	FD_SET(new, set);
++
++	client = malloc(sizeof(struct client));
++	if (!client) {
++		perror("malloc");
++		exit(1);
++	}
++
++	client->sock = new;
++	LIST_INIT(&client->allocs);
++	LIST_INSERT_HEAD(&clients, client, list);
++
++	return 0;
++}
++
++int create_socket(uint16_t port)
++{
++	int sock, opt = 1;
++	struct sockaddr_in name;
++
++	sock = socket(PF_INET, SOCK_STREAM, 0);
++	if (sock < 0) {
++		perror("socket");
++		exit(1);
++	}
++
++	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
++
++	name.sin_family = AF_INET;
++	name.sin_port = htons(port);
++	name.sin_addr.s_addr = htonl(INADDR_ANY);
++	if (bind(sock, (struct sockaddr *) &name, sizeof(name)) < 0) {
++		perror ("bind");
++		exit(1);
++	}
++	return sock;
++}
+-- 
+2.1.3
+
