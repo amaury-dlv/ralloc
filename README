@@ -1,0 +1,49 @@
+RALLOC(2)                     Programmer's Manual                      RALLOC(2)
+
+
+
+NAME
+       ralloc, rfree - allocate and free remote memory
+
+SYNOPSIS
+       void *ralloc(size_t size, const char *host, int port);
+       void rfree(void *ptr);
+
+DESCRIPTION
+       The  ralloc()  function allocates size bytes on a remote ralloc server
+       and returns a pointer to a writable and readable memory area of the
+       requested size.  The memory is not initialized.  If size is 0, then
+       ralloc() returns NULL.  Pointers returned by ralloc() can later be
+       successfully passed to rfree().  The effective allocated memory on the
+       local host will not exceed 4K regardless of the size of the memory area.
+
+       The  rfree()  function frees the memory space pointed to by ptr, which
+       must have been returned by a previous call to ralloc().
+
+RETURN VALUE
+       The  ralloc()  function returns a pointer to a memory area.
+
+EXAMPLE
+
+       #include <stdlib.h>
+       #include <string.h>
+
+       int main(int argc, char **argv)
+       {
+           void *ptr;
+
+           ptr = ralloc(1024, "10.0.2.2", 8700);
+           if (ptr == NULL)
+               return 1;
+
+           memset(ptr, 0xff, 1024);
+
+           rfree(ptr);
+
+           return 0;
+       }
+
+SEE ALSO
+       mmap(2), malloc(3)
+
+Linux                             2014-12-13                           RALLOC(2)
